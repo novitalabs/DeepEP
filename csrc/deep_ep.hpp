@@ -270,6 +270,7 @@ public:
                          bool use_fp8,
                          bool round_scale,
                          bool use_ue8m0,
+                         bool per_token,
                          bool async,
                          bool return_recv_hook);
 

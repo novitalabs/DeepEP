@@ -126,7 +126,7 @@ void clean_low_latency_buffer(int* clean_0,
                   sync_buffer_ptr);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, bool kPerToken, int kHidden>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -171,20 +171,24 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
-    const int num_scales = kHidden / kNumPerChannels;
+    const int num_scales = (kUseFP8 && kPerToken) ? 1 : (kHidden / kNumPerChannels);
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
 
     // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
-    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    const size_t scale_bytes_aligned = align_up<size_t>(num_scales * sizeof(float), sizeof(int4));
+    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + scale_bytes_aligned) : (kHidden * sizeof(nv_bfloat16)));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
     // Expert counts
     constexpr int kNumMaxWarpGroups = 32;
     __shared__ int shared_num_tokens_sent_per_expert[kNumMaxWarpGroups];
+
+    // Shared memory for per-token amax cross-warp reduction
+    __shared__ float shared_per_token_amax[kNumMaxWarpGroups];
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -196,7 +200,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     if (warp_id < num_warps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
         EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
-        EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
+        if constexpr (not kPerToken) {
+            EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
+        }
         const auto num_threads = (num_warps - 1) * 32;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
@@ -210,43 +216,100 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
-            // FP8 cast
-            EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
-            #pragma unroll
-            for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
-                // Read
-                auto int4_value = __ldg(x_int4 + i);
-
-                if constexpr (kUseFP8) {
-                    // Calculate local amax
+            if constexpr (kUseFP8 and kPerToken) {
+                // Per-token FP8 cast: two-pass approach
+                // Pass 1: compute per-thread amax across entire hidden dimension
+                EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
+                float thread_amax = kFP8Margin;
+                for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
+                    auto int4_value = __ldg(x_int4 + i);
                     auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
-                    float fp32_values[kNumElemsPerRead];
-                    float amax = kFP8Margin, scale, scale_inv;
                     #pragma unroll
-                    for (int j = 0; j < kNumElemsPerRead; ++j) {
-                        fp32_values[j] = static_cast<float>(bf16_values[j]);
-                        amax = fmaxf(amax, fabsf(fp32_values[j]));
-                    }
+                    for (int j = 0; j < kNumElemsPerRead; ++j)
+                        thread_amax = fmaxf(thread_amax, fabsf(static_cast<float>(bf16_values[j])));
+                }
 
-                    // Reduce amax and scale
-                    EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
-                    amax = warp_reduce_max<16>(amax);
-                    calculate_fp8_scales(amax, scale, scale_inv, round_scale);
-                    if (lane_id == 0 or lane_id == 16)
-                        rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
+                // Warp-level reduction
+                thread_amax = warp_reduce_max<32>(thread_amax);
 
-                    // Cast into send buffer
+                // Cross-warp reduction via shared memory
+                if (lane_id == 0)
+                    shared_per_token_amax[warp_id] = thread_amax;
+                asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
+
+                // Warp 0 reduces across all sending warps
+                float token_amax = kFP8Margin;
+                if (warp_id == 0) {
+                    token_amax = (lane_id < num_warps - 1) ? shared_per_token_amax[lane_id] : kFP8Margin;
+                    token_amax = warp_reduce_max<32>(token_amax);
+                }
+
+                // Broadcast result to all threads
+                if (warp_id == 0 and lane_id == 0)
+                    shared_per_token_amax[0] = token_amax;
+                asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
+                token_amax = shared_per_token_amax[0];
+
+                // Compute scale from global amax
+                float scale, scale_inv;
+                calculate_fp8_scales(token_amax, scale, scale_inv, round_scale);
+                if (thread_id == 0)
+                    rdma_x_scales[0] = scale_inv;
+
+                // Pass 2: re-read BF16 data, quantize with global scale, write FP8
+                #pragma unroll
+                for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
+                    auto int4_value = __ldg(x_int4 + i);
+                    auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
                     vec_t int2_value;
                     auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
                     #pragma unroll
                     for (int j = 0; j < kNumElemsPerRead; j += 2) {
-                        float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
+                        float2 fp32x2 = {static_cast<float>(bf16_values[j]) * scale,
+                                          static_cast<float>(bf16_values[j + 1]) * scale};
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
                     }
                     rdma_x_vec[i] = int2_value;
-                } else {
-                    // Reinterpret-cast is for C++14 compatibility
-                    rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
+                }
+            } else {
+                // Original per-128-channel FP8 cast or BF16 copy
+                EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
+                #pragma unroll
+                for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
+                    // Read
+                    auto int4_value = __ldg(x_int4 + i);
+
+                    if constexpr (kUseFP8) {
+                        // Calculate local amax
+                        auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
+                        float fp32_values[kNumElemsPerRead];
+                        float amax = kFP8Margin, scale, scale_inv;
+                        #pragma unroll
+                        for (int j = 0; j < kNumElemsPerRead; ++j) {
+                            fp32_values[j] = static_cast<float>(bf16_values[j]);
+                            amax = fmaxf(amax, fabsf(fp32_values[j]));
+                        }
+
+                        // Reduce amax and scale
+                        EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
+                        amax = warp_reduce_max<16>(amax);
+                        calculate_fp8_scales(amax, scale, scale_inv, round_scale);
+                        if (lane_id == 0 or lane_id == 16)
+                            rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
+
+                        // Cast into send buffer
+                        vec_t int2_value;
+                        auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
+                        #pragma unroll
+                        for (int j = 0; j < kNumElemsPerRead; j += 2) {
+                            float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
+                            fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
+                        }
+                        rdma_x_vec[i] = int2_value;
+                    } else {
+                        // Reinterpret-cast is for C++14 compatibility
+                        rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
+                    }
                 }
             }
             asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
@@ -487,6 +550,7 @@ void dispatch(void* packed_recv_x,
               bool use_fp8,
               bool round_scale,
               bool use_ue8m0,
+              bool per_token,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
@@ -509,16 +573,20 @@ void dispatch(void* packed_recv_x,
     // FP8 checks
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
+    if (per_token)
+        EP_HOST_ASSERT(use_fp8 and not use_ue8m0 and "Per-token FP8 requires `use_fp8=True` and `use_ue8m0=False`");
 
-#define DISPATCH_LAUNCH_CASE(hidden)                         \
-    {                                                        \
-        auto dispatch_func = dispatch<false, false, hidden>; \
-        if (use_fp8 and not use_ue8m0)                       \
-            dispatch_func = dispatch<true, false, hidden>;   \
-        if (use_fp8 and use_ue8m0)                           \
-            dispatch_func = dispatch<true, true, hidden>;    \
-        LAUNCH_KERNEL(&cfg,                                  \
-                      dispatch_func,                         \
+#define DISPATCH_LAUNCH_CASE(hidden)                                  \
+    {                                                                  \
+        auto dispatch_func = dispatch<false, false, false, hidden>;    \
+        if (use_fp8 and not use_ue8m0 and not per_token)               \
+            dispatch_func = dispatch<true, false, false, hidden>;      \
+        if (use_fp8 and use_ue8m0)                                     \
+            dispatch_func = dispatch<true, true, false, hidden>;       \
+        if (use_fp8 and per_token)                                     \
+            dispatch_func = dispatch<true, false, true, hidden>;       \
+        LAUNCH_KERNEL(&cfg,                                            \
+                      dispatch_func,                                   \
                       packed_recv_x,                         \
                       packed_recv_x_scales,                  \
                       packed_recv_src_info,                  \

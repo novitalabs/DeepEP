@@ -58,6 +58,15 @@ def per_token_cast_to_fp8(x: torch.Tensor):
         m, aligned_n)[:, :n].contiguous(), (x_amax / 448.0).view(m, -1)
 
 
+def per_token_cast_to_fp8_pertok(x: torch.Tensor):
+    """Per-token FP8 cast: 1 scale for the entire hidden dimension per token."""
+    assert x.dim() == 2
+    m, n = x.shape
+    x_amax = x.abs().float().amax(dim=1, keepdim=True).clamp(1e-4)  # [m, 1]
+    x_fp8 = (x.float() * (448.0 / x_amax)).to(torch.float8_e4m3fn)
+    return x_fp8, (x_amax / 448.0)  # [m, n], [m, 1]
+
+
 def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
     if x_fp8.numel() == 0:
         return x_fp8.to(torch.bfloat16)
